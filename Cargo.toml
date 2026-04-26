@@ -1,0 +1,20 @@
+[package]
+name = "speconn"
+version = "0.0.1"
+edition = "2024"
+description = "Rust runtime for Speconn RPC"
+license = "Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+http = "1"
+tower = "0.5"
+tokio = { version = "1", features = ["full"], optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+
+[features]
+default = ["server"]
+server = ["dep:hyper", "dep:hyper-util", "dep:tokio", "dep:http-body-util"]

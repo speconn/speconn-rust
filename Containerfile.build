@@ -1,0 +1,15 @@
+FROM dhi.io/rust:1-alpine3.23-dev AS builder
+WORKDIR /app
+RUN apk add --no-cache git
+COPY Cargo.toml ./
+RUN mkdir src && echo "" > src/lib.rs
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo check --all-features 2>/dev/null || true
+COPY src/ src/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo check --all-features
+
+FROM scratch
+COPY --from=builder /app/Cargo.toml /out/Cargo.toml

@@ -1,90 +1,75 @@
-use crate::{SpeconnError, Code, decode_envelope, FLAG_END_STREAM};
+use crate::envelope::{decode_envelope, FLAG_END_STREAM};
+use crate::error::{Code, SpeconnError};
+use crate::transport::Transport;
 
-#[cfg(feature = "client")]
-pub struct SpeconnClient {
+pub struct SpeconnClient<T: Transport> {
     base_url: String,
-    client: reqwest::Client,
+    transport: T,
 }
 
-#[cfg(feature = "client")]
-impl SpeconnClient {
-    pub fn new(base_url: &str) -> Self {
+impl<T: Transport> SpeconnClient<T> {
+    pub fn new(base_url: &str, transport: T) -> Self {
         SpeconnClient {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            transport,
         }
     }
 
-    pub async fn call_unary<Req: serde::Serialize, Res: serde::de::DeserializeOwned>(
+    pub async fn call<Req: serde::Serialize, Res: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         req: &Req,
     ) -> Result<Res, SpeconnError> {
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.client
-            .post(&url)
-            .header("content-type", "application/json")
-            .json(req)
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
+        let body = serde_json::to_vec(req).map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let err: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+        let resp = self.transport.post(&url, "application/json", &body, &[]).await?;
+
+        if resp.status >= 400 {
+            let err: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or(serde_json::json!({}));
             return Err(SpeconnError::new(
                 Code::from_str(err["code"].as_str().unwrap_or("unknown")),
-                err["message"].as_str().unwrap_or(&body).to_string(),
+                err["message"].as_str().unwrap_or("").to_string(),
             ));
         }
 
-        resp.json::<Res>().await
-            .map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))
+        serde_json::from_slice(&resp.body).map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))
     }
 
-    pub async fn call_server_stream<Req: serde::Serialize, Res: serde::de::DeserializeOwned>(
+    pub async fn stream<Req: serde::Serialize, Res: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         req: &Req,
     ) -> Result<Vec<Res>, SpeconnError> {
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.client
-            .post(&url)
-            .header("content-type", "application/connect+json")
-            .header("connect-protocol-version", "1")
-            .json(req)
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
+        let body = serde_json::to_vec(req).map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let err: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+        let resp = self.transport.post(
+            &url,
+            "application/connect+json",
+            &body,
+            &[("connect-protocol-version", "1")],
+        ).await?;
+
+        if resp.status >= 400 {
+            let err: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or(serde_json::json!({}));
             return Err(SpeconnError::new(
                 Code::from_str(err["code"].as_str().unwrap_or("unknown")),
-                err["message"].as_str().unwrap_or(&body).to_string(),
+                err["message"].as_str().unwrap_or("").to_string(),
             ));
         }
-
-        let resp_body = resp.bytes().await
-            .map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))?;
 
         let mut results = Vec::new();
         let mut pos = 0;
 
-        while pos < resp_body.len() {
-            if resp_body.len() - pos < 5 {
-                break;
-            }
-            let (flags, payload) = decode_envelope(&resp_body[pos..])
+        while pos < resp.body.len() {
+            if resp.body.len() - pos < 5 { break; }
+            let (flags, payload) = decode_envelope(&resp.body[pos..])
                 .map_err(|e| SpeconnError::new(Code::Internal, e))?;
             pos += 5 + payload.len();
 
             if flags & FLAG_END_STREAM != 0 {
-                let trailer: serde_json::Value = serde_json::from_slice(payload)
-                    .unwrap_or(serde_json::json!({}));
+                let trailer: serde_json::Value = serde_json::from_slice(payload).unwrap_or(serde_json::json!({}));
                 if let Some(err) = trailer.get("error") {
                     return Err(SpeconnError::new(
                         Code::from_str(err["code"].as_str().unwrap_or("unknown")),
@@ -103,31 +88,16 @@ impl SpeconnClient {
     }
 }
 
-#[cfg(feature = "client")]
-fn map_reqwest_error(e: reqwest::Error) -> SpeconnError {
-    SpeconnError::new(Code::Unavailable, e.to_string())
+#[cfg(feature = "reqwest")]
+impl SpeconnClient<crate::transport::ReqwestTransport> {
+    pub fn new_reqwest(base_url: &str) -> Self {
+        Self::new(base_url, crate::transport::ReqwestTransport::new())
+    }
 }
 
-impl Code {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "canceled" => Self::Canceled,
-            "unknown" => Self::Unknown,
-            "invalid_argument" => Self::InvalidArgument,
-            "deadline_exceeded" => Self::DeadlineExceeded,
-            "not_found" => Self::NotFound,
-            "already_exists" => Self::AlreadyExists,
-            "permission_denied" => Self::PermissionDenied,
-            "resource_exhausted" => Self::ResourceExhausted,
-            "failed_precondition" => Self::FailedPrecondition,
-            "aborted" => Self::Aborted,
-            "out_of_range" => Self::OutOfRange,
-            "unimplemented" => Self::Unimplemented,
-            "internal" => Self::Internal,
-            "unavailable" => Self::Unavailable,
-            "data_loss" => Self::DataLoss,
-            "unauthenticated" => Self::Unauthenticated,
-            _ => Self::Unknown,
-        }
+#[cfg(feature = "isahc")]
+impl SpeconnClient<crate::transport::IsahcTransport> {
+    pub fn new_isahc(base_url: &str) -> Self {
+        Self::new(base_url, crate::transport::IsahcTransport::new())
     }
 }

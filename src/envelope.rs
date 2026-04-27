@@ -9,14 +9,14 @@ pub fn encode_envelope(flags: u8, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-pub fn decode_envelope(frame: &[u8]) -> Result<(u8, &[u8]), String> {
-    if frame.len() < 5 {
-        return Err(format!("envelope: frame too short ({} bytes)", frame.len()));
+pub fn decode_envelope(data: &[u8]) -> Result<(u8, &[u8]), String> {
+    if data.len() < 5 {
+        return Err(format!("envelope: frame too short ({} bytes)", data.len()));
     }
-    let flags = frame[0];
-    let length = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
-    if frame.len() < 5 + length {
-        return Err(format!("envelope: expected {} payload bytes, got {}", length, frame.len() - 5));
+    let flags = data[0];
+    let length = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+    if data.len() < 5 + length {
+        return Err(format!("envelope: expected {} payload bytes, got {}", length, data.len() - 5));
     }
-    Ok((flags, &frame[5..5 + length]))
+    Ok((flags, &data[5..5 + length]))
 }

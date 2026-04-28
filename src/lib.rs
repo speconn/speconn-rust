@@ -18,4 +18,4 @@ pub use transport::ReqwestTransport;
 pub use transport::IsahcTransport;
 
 #[cfg(feature = "server")]
-pub use router::SpeconnRouter;
+pub use router::{SpeconnRouter, SpeconnRequest, RouterResponse, Interceptor};

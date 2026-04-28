@@ -1,6 +1,8 @@
 FROM dhi.io/rust:1-alpine3.23-dev AS builder
 WORKDIR /app
-RUN apk add --no-cache git
+RUN apk add --no-cache git openssl-dev pkgconfig
+ENV HTTP_PROXY=http://127.0.0.1:17890
+ENV HTTPS_PROXY=http://127.0.0.1:17890
 COPY Cargo.toml ./
 RUN mkdir src && echo "" > src/lib.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

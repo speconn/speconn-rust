@@ -2,6 +2,28 @@ use crate::envelope::{decode_envelope, FLAG_END_STREAM};
 use crate::error::{Code, SpeconnError};
 use crate::transport::Transport;
 
+pub struct CallOption {
+    headers: Vec<(String, String)>,
+}
+
+impl CallOption {
+    pub fn headers(&self) -> Vec<(&str, &str)> {
+        self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+    }
+}
+
+pub fn with_header(key: &str, value: &str) -> CallOption {
+    CallOption {
+        headers: vec![(key.to_string(), value.to_string())],
+    }
+}
+
+pub fn with_headers(headers: Vec<(&str, &str)>) -> CallOption {
+    CallOption {
+        headers: headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+    }
+}
+
 pub struct SpeconnClient<T: Transport> {
     base_url: String,
     transport: T,
@@ -19,11 +41,13 @@ impl<T: Transport> SpeconnClient<T> {
         &self,
         path: &str,
         req: &Req,
+        options: &[CallOption],
     ) -> Result<Res, SpeconnError> {
         let url = format!("{}{}", self.base_url, path);
         let body = serde_json::to_vec(req).map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))?;
 
-        let resp = self.transport.post(&url, "application/json", &body, &[]).await?;
+        let headers: Vec<(&str, &str)> = options.iter().flat_map(|o| o.headers()).collect();
+        let resp = self.transport.post(&url, "application/json", &body, &headers).await?;
 
         if resp.status >= 400 {
             let err: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or(serde_json::json!({}));
@@ -40,15 +64,21 @@ impl<T: Transport> SpeconnClient<T> {
         &self,
         path: &str,
         req: &Req,
+        options: &[CallOption],
     ) -> Result<Vec<Res>, SpeconnError> {
         let url = format!("{}{}", self.base_url, path);
         let body = serde_json::to_vec(req).map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))?;
+
+        let mut headers: Vec<(&str, &str)> = vec![("connect-protocol-version", "1")];
+        for opt in options {
+            headers.extend(opt.headers());
+        }
 
         let resp = self.transport.post(
             &url,
             "application/connect+json",
             &body,
-            &[("connect-protocol-version", "1")],
+            &headers,
         ).await?;
 
         if resp.status >= 400 {

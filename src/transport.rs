@@ -46,6 +46,7 @@ impl HttpClient for reqwest::Client {
     }
 }
 
+#[cfg(feature = "reqwest")]
 pub fn default_http_client() -> reqwest::Client {
     reqwest::Client::new()
 }

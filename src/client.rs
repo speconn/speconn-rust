@@ -2,9 +2,9 @@ use crate::envelope::{decode_envelope, FLAG_END_STREAM};
 use crate::error::{Code, SpeconnError};
 use crate::transport::HttpClient;
 
-/// A request builder that carries message + headers.
 pub struct RequestBuilder<'a, C: HttpClient> {
-    client: &'a SpeconnClient<C>,
+    http_client: &'a C,
+    base_url: &'a str,
     path: &'a str,
     req_body: Vec<u8>,
     headers: Vec<(String, String)>,
@@ -17,11 +17,11 @@ impl<'a, C: HttpClient> RequestBuilder<'a, C> {
     }
 
     pub async fn call<Res: serde::de::DeserializeOwned>(self) -> Result<Res, SpeconnError> {
-        let url = format!("{}{}", self.client.base_url, self.path);
+        let url = format!("{}{}", self.base_url, self.path);
         let mut headers: Vec<(&str, &str)> = vec![("content-type", "application/json")];
         let owned: Vec<(&str, &str)> = self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         headers.extend(owned.iter().copied());
-        let resp = self.client.http_client.post(&url, &headers, self.req_body).await?;
+        let resp = self.http_client.post(&url, &headers, self.req_body).await?;
         if resp.status >= 400 {
             let err: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or(serde_json::json!({}));
             return Err(SpeconnError::new(
@@ -33,14 +33,14 @@ impl<'a, C: HttpClient> RequestBuilder<'a, C> {
     }
 
     pub async fn stream<Res: serde::de::DeserializeOwned>(self) -> Result<Vec<Res>, SpeconnError> {
-        let url = format!("{}{}", self.client.base_url, self.path);
+        let url = format!("{}{}", self.base_url, self.path);
         let mut headers: Vec<(&str, &str)> = vec![
             ("content-type", "application/connect+json"),
             ("connect-protocol-version", "1"),
         ];
         let owned: Vec<(&str, &str)> = self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         headers.extend(owned.iter().copied());
-        let resp = self.client.http_client.post(&url, &headers, self.req_body).await?;
+        let resp = self.http_client.post(&url, &headers, self.req_body).await?;
         if resp.status >= 400 {
             let err: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or(serde_json::json!({}));
             return Err(SpeconnError::new(
@@ -89,7 +89,8 @@ impl<C: HttpClient> SpeconnClient<C> {
     pub fn request<'a, Req: serde::Serialize>(&'a self, path: &'a str, req: Req) -> RequestBuilder<'a, C> {
         let req_body = serde_json::to_vec(&req).unwrap_or_default();
         RequestBuilder {
-            client: self,
+            http_client: &self.http_client,
+            base_url: &self.base_url,
             path,
             req_body,
             headers: Vec::new(),

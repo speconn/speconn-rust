@@ -8,9 +8,7 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
-/// HttpClient is the trait Speconn expects HTTP clients to implement.
-/// reqwest::Client implements HttpClient via the provided blanket impl.
-pub trait HttpClient: Send + Sync {
+pub trait SpeconnTransport: Send + Sync {
     fn post(
         &self,
         url: &str,
@@ -20,14 +18,33 @@ pub trait HttpClient: Send + Sync {
 }
 
 #[cfg(feature = "reqwest")]
-impl HttpClient for reqwest::Client {
+pub struct ReqwestTransport {
+    client: reqwest::Client,
+}
+
+#[cfg(feature = "reqwest")]
+impl ReqwestTransport {
+    pub fn new() -> Self {
+        Self { client: reqwest::Client::new() }
+    }
+}
+
+#[cfg(feature = "reqwest")]
+impl Default for ReqwestTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "reqwest")]
+impl SpeconnTransport for ReqwestTransport {
     fn post(
         &self,
         url: &str,
         headers: &[(&str, &str)],
         body: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, SpeconnError>> + Send>> {
-        let client = self.clone();
+        let client = self.client.clone();
         let url = url.to_string();
         let headers: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
@@ -44,9 +61,4 @@ impl HttpClient for reqwest::Client {
             Ok(HttpResponse { status, body: resp_body })
         })
     }
-}
-
-#[cfg(feature = "reqwest")]
-pub fn default_http_client() -> reqwest::Client {
-    reqwest::Client::new()
 }

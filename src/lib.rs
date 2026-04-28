@@ -9,10 +9,7 @@ pub mod router;
 pub use error::{Code, SpeconnError};
 pub use envelope::{decode_envelope, encode_envelope, FLAG_COMPRESSED, FLAG_END_STREAM};
 pub use transport::Transport;
-pub use client::SpeconnClient;
-pub use client::CallOption;
-pub use client::with_header;
-pub use client::with_headers;
+pub use client::{SpeconnClient, RequestBuilder};
 
 #[cfg(feature = "reqwest")]
 pub use transport::ReqwestTransport;

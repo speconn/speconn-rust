@@ -2,8 +2,19 @@ use crate::{Code, SpeconnError, encode_envelope, FLAG_END_STREAM};
 use serde_json::Value;
 use std::collections::HashMap;
 
-type UnaryHandler = Box<dyn Fn(Value) -> Result<Value, SpeconnError> + Send + Sync>;
-type StreamHandler = Box<dyn Fn(Value, Box<dyn Fn(Value) + Send + Sync>) -> Result<(), SpeconnError> + Send + Sync>;
+type UnaryHandler = Box<dyn Fn(&SpeconnContext, Value) -> Result<Value, SpeconnError> + Send + Sync>;
+type StreamHandler = Box<dyn Fn(&SpeconnContext, Value, Box<dyn Fn(Value) + Send + Sync>) -> Result<(), SpeconnError> + Send + Sync>;
+
+pub struct SpeconnContext {
+    pub headers: HashMap<String, String>,
+    pub values: HashMap<String, String>,
+}
+
+impl SpeconnContext {
+    pub fn user(&self) -> &str {
+        self.values.get("user").map(|s| s.as_str()).unwrap_or("")
+    }
+}
 
 pub struct RouterResponse {
     pub status: u16,
@@ -17,12 +28,11 @@ pub struct SpeconnRequest {
     pub headers: HashMap<String, String>,
     pub body: Value,
     pub content_type: String,
-    pub values: HashMap<String, String>,
 }
 
 pub trait Interceptor: Send + Sync {
-    fn before(&self, req: &mut SpeconnRequest) -> Result<(), SpeconnError>;
-    fn after(&self, _req: &SpeconnRequest, _resp: &mut RouterResponse) {}
+    fn before(&self, ctx: &mut SpeconnContext, req: &mut SpeconnRequest) -> Result<(), SpeconnError>;
+    fn after(&self, ctx: &SpeconnContext, resp: &mut RouterResponse) {}
 }
 
 pub struct SpeconnRouter {
@@ -49,12 +59,12 @@ impl SpeconnRouter {
     where
         Req: serde::de::DeserializeOwned + Send + Sync + 'static,
         Res: serde::Serialize + Send + Sync + 'static,
-        F: Fn(Req) -> Result<Res, SpeconnError> + Send + Sync + 'static,
+        F: Fn(&SpeconnContext, Req) -> Result<Res, SpeconnError> + Send + Sync + 'static,
     {
-        self.unary_routes.insert(path.to_string(), Box::new(move |v: Value| {
+        self.unary_routes.insert(path.to_string(), Box::new(move |ctx: &SpeconnContext, v: Value| {
             let req: Req = serde_json::from_value(v)
                 .map_err(|e| SpeconnError::new(Code::InvalidArgument, e.to_string()))?;
-            let res = f(req)?;
+            let res = f(ctx, req)?;
             serde_json::to_value(res).map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))
         }));
         self
@@ -64,15 +74,15 @@ impl SpeconnRouter {
     where
         Req: serde::de::DeserializeOwned + Send + Sync + 'static,
         Res: serde::Serialize + Send + Sync + 'static,
-        F: Fn(Req, Box<dyn Fn(Res) + Send + Sync>) -> Result<(), SpeconnError> + Send + Sync + 'static,
+        F: Fn(&SpeconnContext, Req, Box<dyn Fn(Res) + Send + Sync>) -> Result<(), SpeconnError> + Send + Sync + 'static,
     {
-        self.stream_routes.insert(path.to_string(), Box::new(move |v: Value, send: Box<dyn Fn(Value) + Send + Sync>| {
+        self.stream_routes.insert(path.to_string(), Box::new(move |ctx: &SpeconnContext, v: Value, send: Box<dyn Fn(Value) + Send + Sync>| {
             let req: Req = serde_json::from_value(v)
                 .map_err(|e| SpeconnError::new(Code::InvalidArgument, e.to_string()))?;
             let typed_send: Box<dyn Fn(Res) + Send + Sync> = Box::new(move |msg: Res| {
                 send(serde_json::to_value(msg).unwrap());
             });
-            f(req, typed_send)
+            f(ctx, req, typed_send)
         }));
         self
     }
@@ -86,16 +96,19 @@ impl SpeconnRouter {
     ) -> RouterResponse {
         let value: Value = serde_json::from_slice(body).unwrap_or(Value::Object(serde_json::Map::new()));
 
+        let mut ctx = SpeconnContext {
+            headers: headers.clone(),
+            values: HashMap::new(),
+        };
         let mut req = SpeconnRequest {
             path: path.to_string(),
             headers: headers.clone(),
             body: value,
             content_type: content_type.to_string(),
-            values: HashMap::new(),
         };
 
         for interceptor in &self.interceptors {
-            if let Err(e) = interceptor.before(&mut req) {
+            if let Err(e) = interceptor.before(&mut ctx, &mut req) {
                 return json_error(e.code, &e.message);
             }
         }
@@ -105,20 +118,20 @@ impl SpeconnRouter {
 
         let mut resp = if is_stream {
             if let Some(handler) = self.stream_routes.get(route_path) {
-                handle_stream(handler, &req.body)
+                handle_stream(handler, &ctx, &req.body)
             } else if let Some(handler) = self.unary_routes.get(route_path) {
-                handle_unary(handler, &req.body)
+                handle_unary(handler, &ctx, &req.body)
             } else {
                 json_error(Code::NotFound, &format!("no route: {}", route_path))
             }
         } else if let Some(handler) = self.unary_routes.get(route_path) {
-            handle_unary(handler, &req.body)
+            handle_unary(handler, &ctx, &req.body)
         } else {
             json_error(Code::NotFound, &format!("no route: {}", route_path))
         };
 
         for interceptor in &self.interceptors {
-            interceptor.after(&req, &mut resp);
+            interceptor.after(&ctx, &mut resp);
         }
 
         resp
@@ -129,8 +142,8 @@ impl Default for SpeconnRouter {
     fn default() -> Self { Self::new() }
 }
 
-fn handle_unary(handler: &UnaryHandler, body: &Value) -> RouterResponse {
-    match handler(body.clone()) {
+fn handle_unary(handler: &UnaryHandler, ctx: &SpeconnContext, body: &Value) -> RouterResponse {
+    match handler(ctx, body.clone()) {
         Ok(res) => {
             let body = serde_json::to_vec(&res).unwrap();
             RouterResponse { status: 200, content_type: "application/json".to_string(), body, headers: Vec::new() }
@@ -139,7 +152,7 @@ fn handle_unary(handler: &UnaryHandler, body: &Value) -> RouterResponse {
     }
 }
 
-fn handle_stream(handler: &StreamHandler, body: &Value) -> RouterResponse {
+fn handle_stream(handler: &StreamHandler, ctx: &SpeconnContext, body: &Value) -> RouterResponse {
     use std::sync::{Arc, Mutex};
     let chunks: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let chunks_clone = chunks.clone();
@@ -147,7 +160,7 @@ fn handle_stream(handler: &StreamHandler, body: &Value) -> RouterResponse {
         let payload = serde_json::to_vec(&msg).unwrap();
         chunks_clone.lock().unwrap().push(encode_envelope(0, &payload));
     });
-    match handler(body.clone(), send) {
+    match handler(ctx, body.clone(), send) {
         Ok(()) => {
             let trailer = serde_json::json!({});
             chunks.lock().unwrap().push(encode_envelope(FLAG_END_STREAM, &serde_json::to_vec(&trailer).unwrap()));

@@ -1,16 +1,16 @@
 use crate::envelope::{decode_envelope, FLAG_END_STREAM};
 use crate::error::{Code, SpeconnError};
-use crate::transport::Transport;
+use crate::transport::HttpClient;
 
 /// A request builder that carries message + headers.
-pub struct RequestBuilder<'a, T: Transport, Req: serde::Serialize> {
-    client: &'a SpeconnClient<T>,
+pub struct RequestBuilder<'a, C: HttpClient> {
+    client: &'a SpeconnClient<C>,
     path: &'a str,
-    req: Req,
+    req_body: Vec<u8>,
     headers: Vec<(String, String)>,
 }
 
-impl<'a, T: Transport, Req: serde::Serialize> RequestBuilder<'a, T, Req> {
+impl<'a, C: HttpClient> RequestBuilder<'a, C> {
     pub fn header(mut self, key: &str, value: &str) -> Self {
         self.headers.push((key.to_string(), value.to_string()));
         self
@@ -18,10 +18,10 @@ impl<'a, T: Transport, Req: serde::Serialize> RequestBuilder<'a, T, Req> {
 
     pub async fn call<Res: serde::de::DeserializeOwned>(self) -> Result<Res, SpeconnError> {
         let url = format!("{}{}", self.client.base_url, self.path);
-        let body = serde_json::to_vec(&self.req)
-            .map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))?;
-        let headers: Vec<(&str, &str)> = self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let resp = self.client.transport.post(&url, "application/json", &body, &headers).await?;
+        let mut headers: Vec<(&str, &str)> = vec![("content-type", "application/json")];
+        let owned: Vec<(&str, &str)> = self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        headers.extend(owned.iter().copied());
+        let resp = self.client.http_client.post(&url, &headers, self.req_body).await?;
         if resp.status >= 400 {
             let err: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or(serde_json::json!({}));
             return Err(SpeconnError::new(
@@ -34,12 +34,13 @@ impl<'a, T: Transport, Req: serde::Serialize> RequestBuilder<'a, T, Req> {
 
     pub async fn stream<Res: serde::de::DeserializeOwned>(self) -> Result<Vec<Res>, SpeconnError> {
         let url = format!("{}{}", self.client.base_url, self.path);
-        let body = serde_json::to_vec(&self.req)
-            .map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))?;
-        let mut headers: Vec<(&str, &str)> = vec![("connect-protocol-version", "1")];
+        let mut headers: Vec<(&str, &str)> = vec![
+            ("content-type", "application/connect+json"),
+            ("connect-protocol-version", "1"),
+        ];
         let owned: Vec<(&str, &str)> = self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         headers.extend(owned.iter().copied());
-        let resp = self.client.transport.post(&url, "application/connect+json", &body, &headers).await?;
+        let resp = self.client.http_client.post(&url, &headers, self.req_body).await?;
         if resp.status >= 400 {
             let err: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or(serde_json::json!({}));
             return Err(SpeconnError::new(
@@ -72,39 +73,33 @@ impl<'a, T: Transport, Req: serde::Serialize> RequestBuilder<'a, T, Req> {
     }
 }
 
-pub struct SpeconnClient<T: Transport> {
+pub struct SpeconnClient<C: HttpClient> {
     base_url: String,
-    transport: T,
+    http_client: C,
 }
 
-impl<T: Transport> SpeconnClient<T> {
-    pub fn new(base_url: &str, transport: T) -> Self {
+impl<C: HttpClient> SpeconnClient<C> {
+    pub fn new(base_url: &str, http_client: C) -> Self {
         SpeconnClient {
             base_url: base_url.trim_end_matches('/').to_string(),
-            transport,
+            http_client,
         }
     }
 
-    pub fn request<'a, Req: serde::Serialize>(&'a self, path: &'a str, req: Req) -> RequestBuilder<'a, T, Req> {
+    pub fn request<'a, Req: serde::Serialize>(&'a self, path: &'a str, req: Req) -> RequestBuilder<'a, C> {
+        let req_body = serde_json::to_vec(&req).unwrap_or_default();
         RequestBuilder {
             client: self,
             path,
-            req,
+            req_body,
             headers: Vec::new(),
         }
     }
 }
 
 #[cfg(feature = "reqwest")]
-impl SpeconnClient<crate::transport::ReqwestTransport> {
-    pub fn new_reqwest(base_url: &str) -> Self {
-        Self::new(base_url, crate::transport::ReqwestTransport::new())
-    }
-}
-
-#[cfg(feature = "isahc")]
-impl SpeconnClient<crate::transport::IsahcTransport> {
-    pub fn new_isahc(base_url: &str) -> Self {
-        Self::new(base_url, crate::transport::IsahcTransport::new())
+impl SpeconnClient<reqwest::Client> {
+    pub fn new_default(base_url: &str) -> Self {
+        Self::new(base_url, reqwest::Client::new())
     }
 }

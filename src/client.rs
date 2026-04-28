@@ -85,7 +85,7 @@ impl<T: Transport> SpeconnClient<T> {
         }
     }
 
-    pub fn request<Req: serde::Serialize>(&self, path: &str, req: Req) -> RequestBuilder<'_, T, Req> {
+    pub fn request<'a, Req: serde::Serialize>(&'a self, path: &'a str, req: Req) -> RequestBuilder<'a, T, Req> {
         RequestBuilder {
             client: self,
             path,

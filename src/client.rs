@@ -1,6 +1,20 @@
 use crate::envelope::{decode_envelope, FLAG_END_STREAM};
 use crate::error::{Code, SpeconnError};
 use crate::transport::{HttpResponse, SpeconnTransport};
+use specodec::{SpecCodec, dispatch, respond};
+use std::collections::HashMap;
+
+fn get_content_type<'a>(headers: &'a HashMap<&str, &'a str>) -> &'a str {
+    headers.get("content-type").copied().unwrap_or("application/json")
+}
+
+fn get_accept<'a>(headers: &'a HashMap<&str, &'a str>) -> &'a str {
+    headers.get("accept").copied().unwrap_or_else(|| get_content_type(headers))
+}
+
+fn extract_format(mime: &str) -> &str {
+    if mime.contains("msgpack") { "msgpack" } else { "json" }
+}
 
 pub struct SpeconnClient<T: SpeconnTransport> {
     base_url: String,
@@ -17,34 +31,56 @@ impl<T: SpeconnTransport> SpeconnClient<T> {
         }
     }
 
-    pub async fn call<Req: serde::Serialize, Res: serde::de::DeserializeOwned>(
+    pub async fn call<Treq, Tres>(
         &self,
-        req: Req,
-        headers: &[(&str, &str)],
-    ) -> Result<Res, SpeconnError> {
+        req_codec: &SpecCodec<Treq>,
+        req: &Treq,
+        res_codec: &SpecCodec<Tres>,
+        headers: HashMap<&str, &str>,
+    ) -> Result<Tres, SpeconnError> {
         let url = format!("{}{}", self.base_url, self.path);
-        let body = serde_json::to_vec(&req).unwrap_or_default();
-        let mut h: Vec<(&str, &str)> = vec![("content-type", "application/json")];
-        h.extend_from_iter(headers.iter().copied());
+        let content_type = get_content_type(&headers);
+        let accept = get_accept(&headers);
+        let req_fmt = extract_format(content_type);
+        let res_fmt = extract_format(accept);
+
+        let body = respond(req_codec, req, req_fmt).body;
+
+        let h: Vec<(&str, &str)> = headers.into_iter().collect();
         let resp = self.transport.post(&url, &h, body).await?;
-        parse_unary_response::<Res>(resp)
+        if resp.status >= 400 {
+            return parse_error(&resp);
+        }
+        dispatch(res_codec, &resp.body, res_fmt)
+            .map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))
     }
 
-    pub async fn stream<Req: serde::Serialize, Res: serde::de::DeserializeOwned>(
+    pub async fn stream<Treq, Tres>(
         &self,
-        req: Req,
-        headers: &[(&str, &str)],
-    ) -> Result<Vec<Res>, SpeconnError> {
+        req_codec: &SpecCodec<Treq>,
+        req: &Treq,
+        res_codec: &SpecCodec<Tres>,
+        headers: HashMap<&str, &str>,
+    ) -> Result<Vec<Tres>, SpeconnError> {
         let url = format!("{}{}", self.base_url, self.path);
-        let body = serde_json::to_vec(&req).unwrap_or_default();
-        let h: Vec<(&str, &str)> = vec![
-            ("content-type", "application/connect+json"),
-            ("connect-protocol-version", "1"),
-        ];
-        let mut all_headers: Vec<(&str, &str)> = h;
-        all_headers.extend_from_iter(headers.iter().copied());
-        let resp = self.transport.post(&url, &all_headers, body).await?;
-        parse_stream_response::<Res>(resp)
+        let content_type = get_content_type(&headers);
+        let accept = get_accept(&headers);
+        let req_fmt = extract_format(content_type);
+        let res_fmt = extract_format(accept);
+
+        let body = respond(req_codec, req, req_fmt).body;
+
+        let mut h = headers;
+        if !h.contains_key("connect-protocol-version") {
+            h.insert("connect-protocol-version", "1");
+        }
+
+        let req_headers: Vec<(&str, &str)> = h.into_iter().collect();
+        let resp = self.transport.post(&url, &req_headers, body).await?;
+        if resp.status >= 400 {
+            return parse_error(&resp);
+        }
+        parse_stream_response(res_codec, &resp, res_fmt)
     }
 }
 
@@ -55,45 +91,31 @@ impl SpeconnClient<crate::transport::ReqwestTransport> {
     }
 }
 
-fn parse_unary_response<Res: serde::de::DeserializeOwned>(resp: HttpResponse) -> Result<Res, SpeconnError> {
-    if resp.status >= 400 {
-        let err: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or(serde_json::json!({}));
-        return Err(SpeconnError::new(
-            Code::from_str(err["code"].as_str().unwrap_or("unknown")),
-            err["message"].as_str().unwrap_or("").to_string(),
-        ));
-    }
-    serde_json::from_slice(&resp.body).map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))
+fn parse_error<T>(resp: &HttpResponse) -> Result<T, SpeconnError> {
+    Err(SpeconnError::decode(&resp.body, "json"))
 }
 
-fn parse_stream_response<Res: serde::de::DeserializeOwned>(resp: HttpResponse) -> Result<Vec<Res>, SpeconnError> {
-    if resp.status >= 400 {
-        let err: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or(serde_json::json!({}));
-        return Err(SpeconnError::new(
-            Code::from_str(err["code"].as_str().unwrap_or("unknown")),
-            err["message"].as_str().unwrap_or("").to_string(),
-        ));
-    }
+fn parse_stream_response<T>(
+    codec: &SpecCodec<T>,
+    resp: &HttpResponse,
+    res_fmt: &str,
+) -> Result<Vec<T>, SpeconnError> {
     let mut results = Vec::new();
     let mut pos = 0;
     while pos < resp.body.len() {
         if resp.body.len() - pos < 5 { break; }
         let (flags, payload) = decode_envelope(&resp.body[pos..])
-            .map_err(|e| SpeconnError::new(Code::Internal, e))?;
+            .map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))?;
         pos += 5 + payload.len();
         if flags & FLAG_END_STREAM != 0 {
-            let trailer: serde_json::Value = serde_json::from_slice(payload).unwrap_or(serde_json::json!({}));
-            if let Some(err) = trailer.get("error") {
-                return Err(SpeconnError::new(
-                    Code::from_str(err["code"].as_str().unwrap_or("unknown")),
-                    err["message"].as_str().unwrap_or("").to_string(),
-                ));
+            if !payload.is_empty() {
+                return Err(SpeconnError::decode(payload, res_fmt));
             }
             break;
         }
-        let msg: Res = serde_json::from_slice(payload)
+        let obj = dispatch(codec, payload, res_fmt)
             .map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))?;
-        results.push(msg);
+        results.push(obj);
     }
     Ok(results)
 }

@@ -1,18 +1,18 @@
 [package]
 name = "speconn"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 description = "Rust runtime for Speconn RPC"
 license = "Apache-2.0"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
-isahc = { version = "1", optional = true }
+specodec = { git = "https://github.com/specodec/specodec-rust.git", tag = "v0.0.1" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt", "time", "sync"], optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
 
 [features]
 default = ["reqwest"]
-reqwest = ["dep:reqwest"]
-isahc = ["dep:isahc"]
-server = []
+reqwest = ["dep:reqwest", "dep:serde_json"]
+server = ["dep:tokio", "dep:tokio-util"]

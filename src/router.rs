@@ -1,20 +1,20 @@
 use crate::{Code, SpeconnError, encode_envelope, FLAG_END_STREAM};
-use serde_json::Value;
+use crate::context::SpeconnContext;
+use crate::context_key::{set_user, set_request_id};
+use specodec::{SpecCodec, dispatch, respond};
+
+fn extract_format(mime: &str) -> &str {
+    if mime.contains("msgpack") { "msgpack" } else { "json" }
+}
+
+fn format_to_mime(fmt: &str, stream: bool) -> String {
+    let base = if fmt == "msgpack" { "msgpack" } else { "json" };
+    if stream { format!("application/connect+{}", base) } else { format!("application/{}", base) }
+}
 use std::collections::HashMap;
 
-type UnaryHandler = Box<dyn Fn(&SpeconnContext, Value) -> Result<Value, SpeconnError> + Send + Sync>;
-type StreamHandler = Box<dyn Fn(&SpeconnContext, Value, Box<dyn Fn(Value) + Send + Sync>) -> Result<(), SpeconnError> + Send + Sync>;
-
-pub struct SpeconnContext {
-    pub headers: HashMap<String, String>,
-    pub values: HashMap<String, String>,
-}
-
-impl SpeconnContext {
-    pub fn user(&self) -> &str {
-        self.values.get("user").map(|s| s.as_str()).unwrap_or("")
-    }
-}
+type UnaryHandler = Box<dyn Fn(&SpeconnContext, &[u8], &str, &str) -> Result<Vec<u8>, SpeconnError> + Send + Sync>;
+type StreamHandler = Box<dyn Fn(&SpeconnContext, &[u8], &str, &str, Box<dyn Fn(&[u8]) + Send + Sync>) -> Result<(), SpeconnError> + Send + Sync>;
 
 pub struct RouterResponse {
     pub status: u16,
@@ -26,12 +26,13 @@ pub struct RouterResponse {
 pub struct SpeconnRequest {
     pub path: String,
     pub headers: HashMap<String, String>,
-    pub body: Value,
+    pub body: Vec<u8>,
     pub content_type: String,
+    pub accept: String,
 }
 
 pub trait Interceptor: Send + Sync {
-    fn before(&self, ctx: &mut SpeconnContext, req: &mut SpeconnRequest) -> Result<(), SpeconnError>;
+    fn before(&self, ctx: &SpeconnContext, req: &SpeconnRequest) -> Result<(), SpeconnError>;
     fn after(&self, ctx: &SpeconnContext, resp: &mut RouterResponse) {}
 }
 
@@ -55,32 +56,33 @@ impl SpeconnRouter {
         self
     }
 
-    pub fn unary<Req, Res, F>(mut self, path: &str, f: F) -> Self
+    pub fn unary<Treq, Tres, F>(mut self, path: &str, req_codec: SpecCodec<Treq>, res_codec: SpecCodec<Tres>, f: F) -> Self
     where
-        Req: serde::de::DeserializeOwned + Send + Sync + 'static,
-        Res: serde::Serialize + Send + Sync + 'static,
-        F: Fn(&SpeconnContext, Req) -> Result<Res, SpeconnError> + Send + Sync + 'static,
+        Treq: Send + Sync + 'static,
+        Tres: Send + Sync + 'static,
+        F: Fn(&SpeconnContext, Treq) -> Result<Tres, SpeconnError> + Send + Sync + 'static,
     {
-        self.unary_routes.insert(path.to_string(), Box::new(move |ctx: &SpeconnContext, v: Value| {
-            let req: Req = serde_json::from_value(v)
+        self.unary_routes.insert(path.to_string(), Box::new(move |ctx: &SpeconnContext, body: &[u8], ct: &str, accept: &str| {
+            let req = dispatch(&req_codec, body, extract_format(ct))
                 .map_err(|e| SpeconnError::new(Code::InvalidArgument, e.to_string()))?;
             let res = f(ctx, req)?;
-            serde_json::to_value(res).map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))
+            Ok(respond(&res_codec, &res, extract_format(accept)).body)
         }));
         self
     }
 
-    pub fn server_stream<Req, Res, F>(mut self, path: &str, f: F) -> Self
+    pub fn server_stream<Treq, Tres, F>(mut self, path: &str, req_codec: SpecCodec<Treq>, res_codec: SpecCodec<Tres>, f: F) -> Self
     where
-        Req: serde::de::DeserializeOwned + Send + Sync + 'static,
-        Res: serde::Serialize + Send + Sync + 'static,
-        F: Fn(&SpeconnContext, Req, Box<dyn Fn(Res) + Send + Sync>) -> Result<(), SpeconnError> + Send + Sync + 'static,
+        Treq: Send + Sync + 'static,
+        Tres: Send + Sync + 'static,
+        F: Fn(&SpeconnContext, Treq, Box<dyn Fn(Tres) + Send + Sync>) -> Result<(), SpeconnError> + Send + Sync + 'static,
     {
-        self.stream_routes.insert(path.to_string(), Box::new(move |ctx: &SpeconnContext, v: Value, send: Box<dyn Fn(Value) + Send + Sync>| {
-            let req: Req = serde_json::from_value(v)
+        self.stream_routes.insert(path.to_string(), Box::new(move |ctx: &SpeconnContext, body: &[u8], ct: &str, accept: &str, send: Box<dyn Fn(&[u8]) + Send + Sync>| {
+            let res_fmt = extract_format(accept).to_string();
+            let req = dispatch(&req_codec, body, extract_format(ct))
                 .map_err(|e| SpeconnError::new(Code::InvalidArgument, e.to_string()))?;
-            let typed_send: Box<dyn Fn(Res) + Send + Sync> = Box::new(move |msg: Res| {
-                send(serde_json::to_value(msg).unwrap());
+            let typed_send: Box<dyn Fn(Tres) + Send + Sync> = Box::new(move |msg: Tres| {
+                send(&respond(&res_codec, &msg, &res_fmt).body);
             });
             f(ctx, req, typed_send)
         }));
@@ -91,49 +93,66 @@ impl SpeconnRouter {
         &self,
         path: &str,
         content_type: &str,
+        accept: &str,
         body: &[u8],
         headers: &HashMap<String, String>,
     ) -> RouterResponse {
-        let value: Value = serde_json::from_slice(body).unwrap_or(Value::Object(serde_json::Map::new()));
+        let timeout_ms: Option<u32> = headers
+            .get("speconn-timeout-ms")
+            .and_then(|s| s.parse::<u32>().ok());
 
-        let mut ctx = SpeconnContext {
-            headers: headers.clone(),
-            values: HashMap::new(),
-        };
-        let mut req = SpeconnRequest {
+        let ctx = SpeconnContext::new(
+            headers.clone(),
+            path.to_string(),
+            None,
+            None,
+            timeout_ms,
+        );
+
+        let req = SpeconnRequest {
             path: path.to_string(),
             headers: headers.clone(),
-            body: value,
+            body: body.to_vec(),
             content_type: content_type.to_string(),
+            accept: accept.to_string(),
         };
 
         for interceptor in &self.interceptors {
-            if let Err(e) = interceptor.before(&mut ctx, &mut req) {
+            if let Err(e) = interceptor.before(&ctx, &req) {
+                ctx.cleanup();
                 return json_error(e.code, &e.message);
             }
         }
 
-        let is_stream = req.content_type.contains("connect+json");
+        let is_stream = req.content_type.contains("connect+");
         let route_path = &req.path;
 
         let mut resp = if is_stream {
             if let Some(handler) = self.stream_routes.get(route_path) {
-                handle_stream(handler, &ctx, &req.body)
+                handle_stream(handler, &ctx, &req.body, &req.content_type, &req.accept)
             } else if let Some(handler) = self.unary_routes.get(route_path) {
-                handle_unary(handler, &ctx, &req.body)
+                handle_unary(handler, &ctx, &req.body, &req.content_type, &req.accept)
             } else {
                 json_error(Code::NotFound, &format!("no route: {}", route_path))
             }
         } else if let Some(handler) = self.unary_routes.get(route_path) {
-            handle_unary(handler, &ctx, &req.body)
+            handle_unary(handler, &ctx, &req.body, &req.content_type, &req.accept)
         } else {
             json_error(Code::NotFound, &format!("no route: {}", route_path))
         };
+
+        {
+            let response_headers = ctx.response_headers.lock().unwrap();
+            for (k, v) in response_headers.iter() {
+                resp.headers.push((k.clone(), v.clone()));
+            }
+        }
 
         for interceptor in &self.interceptors {
             interceptor.after(&ctx, &mut resp);
         }
 
+        ctx.cleanup();
         resp
     }
 }
@@ -142,42 +161,69 @@ impl Default for SpeconnRouter {
     fn default() -> Self { Self::new() }
 }
 
-fn handle_unary(handler: &UnaryHandler, ctx: &SpeconnContext, body: &Value) -> RouterResponse {
-    match handler(ctx, body.clone()) {
+fn handle_unary(handler: &UnaryHandler, ctx: &SpeconnContext, body: &[u8], ct: &str, accept: &str) -> RouterResponse {
+    match handler(ctx, body, ct, accept) {
         Ok(res) => {
-            let body = serde_json::to_vec(&res).unwrap();
-            RouterResponse { status: 200, content_type: "application/json".to_string(), body, headers: Vec::new() }
+            let resp_ct = format_to_mime(extract_format(accept), false);
+            let mut headers = Vec::new();
+            {
+                let response_headers = ctx.response_headers.lock().unwrap();
+                for (k, v) in response_headers.iter() {
+                    headers.push((k.clone(), v.clone()));
+                }
+            }
+            RouterResponse { status: 200, content_type: resp_ct, body: res, headers }
         }
         Err(e) => json_error(e.code, &e.message),
     }
 }
 
-fn handle_stream(handler: &StreamHandler, ctx: &SpeconnContext, body: &Value) -> RouterResponse {
+fn handle_stream(handler: &StreamHandler, ctx: &SpeconnContext, body: &[u8], ct: &str, accept: &str) -> RouterResponse {
     use std::sync::{Arc, Mutex};
-    let chunks: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-    let chunks_clone = chunks.clone();
-    let send: Box<dyn Fn(Value) + Send + Sync> = Box::new(move |msg: Value| {
-        let payload = serde_json::to_vec(&msg).unwrap();
-        chunks_clone.lock().unwrap().push(encode_envelope(0, &payload));
-    });
-    match handler(ctx, body.clone(), send) {
-        Ok(()) => {
-            let trailer = serde_json::json!({});
-            chunks.lock().unwrap().push(encode_envelope(FLAG_END_STREAM, &serde_json::to_vec(&trailer).unwrap()));
-        }
-        Err(e) => {
-            let trailer = serde_json::json!({"error": {"code": e.code.as_str(), "message": &e.message}});
-            chunks.lock().unwrap().push(encode_envelope(FLAG_END_STREAM, &serde_json::to_vec(&trailer).unwrap()));
+    
+    {
+        let response_headers = ctx.response_headers.lock().unwrap();
+        if !response_headers.is_empty() {
+            ctx.mark_headers_sent();
         }
     }
+    
+    let chunks: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let chunks_clone = chunks.clone();
+    let send: Box<dyn Fn(&[u8]) + Send + Sync> = Box::new(move |payload: &[u8]| {
+        chunks_clone.lock().unwrap().push(encode_envelope(0, payload));
+    });
+    
+    match handler(ctx, body, ct, accept, send) {
+        Ok(()) => {
+            chunks.lock().unwrap().push(encode_envelope(FLAG_END_STREAM, &[]));
+        }
+        Err(e) => {
+            let payload = e.encode(extract_format(accept));
+            chunks.lock().unwrap().push(encode_envelope(FLAG_END_STREAM, &payload));
+        }
+    }
+    
+    ctx.mark_headers_sent();
+    
     let chunks = Arc::try_unwrap(chunks).unwrap().into_inner().unwrap();
     let mut body = Vec::new();
     for chunk in chunks { body.extend_from_slice(&chunk); }
-    RouterResponse { status: 200, content_type: "application/connect+json".to_string(), body, headers: Vec::new() }
+    let resp_ct = format_to_mime(extract_format(accept), true);
+    
+    let mut headers = Vec::new();
+    {
+        let response_headers = ctx.response_headers.lock().unwrap();
+        for (k, v) in response_headers.iter() {
+            headers.push((k.clone(), v.clone()));
+        }
+    }
+    
+    RouterResponse { status: 200, content_type: resp_ct, body, headers }
 }
 
 fn json_error(code: Code, message: &str) -> RouterResponse {
     let status = code.http_status();
-    let body = serde_json::to_vec(&serde_json::json!({"code": code.as_str(), "message": message})).unwrap();
+    let body = SpeconnError::new(code, message).encode("json");
     RouterResponse { status, content_type: "application/json".to_string(), body, headers: Vec::new() }
 }

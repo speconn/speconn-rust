@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeconnError {
     pub code: Code,
     pub message: String,
@@ -24,7 +24,7 @@ impl SpeconnError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {
     Canceled,
     Unknown,
@@ -114,5 +114,46 @@ impl Code {
             502 | 503 | 504 => Self::Unavailable,
             _ => Self::Unknown,
         }
+    }
+}
+
+use specodec::{respond, dispatch, SpecCodec, JsonWriter, MsgPackWriter, JsonReader, MsgPackReader};
+
+impl SpeconnError {
+    /// Encode to the given format (json / msgpack / gron).
+    pub fn encode(&self, format: &str) -> Vec<u8> {
+        let codec: SpecCodec<SpeconnError> = SpecCodec {
+            encode: |obj, w| {
+                w.begin_object(2);
+                w.write_field("code"); w.write_string(obj.code.as_str());
+                w.write_field("message"); w.write_string(&obj.message);
+                w.end_object();
+            },
+            decode: |_| Err(specodec::SCodecError::new("not used")),
+        };
+        respond(&codec, self, format).body
+    }
+
+    /// Decode a non-empty payload into a SpeconnError.
+    pub fn decode(payload: &[u8], format: &str) -> Self {
+        let codec: SpecCodec<SpeconnError> = SpecCodec {
+            encode: |_, _| {},
+            decode: |r| {
+                let mut code = String::new();
+                let mut message = String::new();
+                r.begin_object()?;
+                while r.has_next_field()? {
+                    match r.read_field_name()?.as_str() {
+                        "code"    => { code = r.read_string()?; }
+                        "message" => { message = r.read_string()?; }
+                        _         => { r.skip()?; }
+                    }
+                }
+                r.end_object()?;
+                Ok(SpeconnError { code: Code::from_str(&code), message })
+            },
+        };
+        dispatch(&codec, payload, format)
+            .unwrap_or_else(|_| SpeconnError::new(Code::Unknown, "decode error"))
     }
 }

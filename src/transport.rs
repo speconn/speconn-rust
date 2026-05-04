@@ -5,6 +5,7 @@ use crate::error::{Code, SpeconnError};
 
 pub struct HttpResponse {
     pub status: u16,
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
@@ -56,9 +57,13 @@ impl SpeconnTransport for ReqwestTransport {
             let resp = req.send().await
                 .map_err(|e| SpeconnError::new(Code::Unavailable, e.to_string()))?;
             let status = resp.status().as_u16();
+            let resp_headers: Vec<(String, String)> = resp.headers()
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
             let resp_body = resp.bytes().await
                 .map_err(|e| SpeconnError::new(Code::Internal, e.to_string()))?.to_vec();
-            Ok(HttpResponse { status, body: resp_body })
+            Ok(HttpResponse { status, headers: resp_headers, body: resp_body })
         })
     }
 }

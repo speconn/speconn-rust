@@ -1,5 +1,5 @@
 [package]
-name = "speconn"
+name = "speconn-runtime-rust"
 version = "0.1.0"
 edition = "2024"
 description = "Rust runtime for Speconn RPC"
@@ -11,6 +11,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde_json = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "time", "sync"], optional = true }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
+futures = { version = "0.3" }
 
 [features]
 default = ["reqwest"]
